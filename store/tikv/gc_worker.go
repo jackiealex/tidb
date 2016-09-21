@@ -21,15 +21,18 @@ import (
 	"github.com/ngaut/log"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/tidb"
+	"github.com/pingcap/tidb/store/tikv/oracle"
 )
 
 // GCWorker periodically triggers GC process on tikv server.
 type GCWorker struct {
-	uuid    string
-	store   *tikvStore
-	session tidb.Session
-	quit    chan struct{}
-	done    chan error
+	uuid        string
+	store       *tikvStore
+	session     tidb.Session
+	gcIsRunning bool
+	lastFinish  time.Time
+	quit        chan struct{}
+	done        chan error
 }
 
 // NewGCWorker creates a GCWorker instance.
@@ -43,13 +46,15 @@ func NewGCWorker(store *tikvStore) (*GCWorker, error) {
 		return nil, errors.Trace(err)
 	}
 	worker := &GCWorker{
-		uuid:    fmt.Sprintf("gcworker_%d", ver.Ver),
-		store:   store,
-		session: session,
-		quit:    make(chan struct{}),
-		done:    make(chan error),
+		uuid:        fmt.Sprintf("gcworker_%d", ver.Ver),
+		store:       store,
+		session:     session,
+		gcIsRunning: false,
+		lastFinish:  time.Now(),
+		quit:        make(chan struct{}),
+		done:        make(chan error),
 	}
-	go worker.start(ver.Ver)
+	go worker.start()
 	return worker, nil
 }
 
@@ -59,18 +64,34 @@ func (w *GCWorker) Close() {
 }
 
 const (
+	gcTimeFormat = "20060102-15:04:05 -0700 MST"
+
 	gcWorkerTickInterval = time.Minute
 	gcWorkerLease        = time.Minute * 2
-	gcRunInterval        = time.Minute * 10
 	gcLeaderUUIDKey      = "tikv_gc_leader_uuid"
 	gcLeaderLeaseKey     = "tikv_gc_leader_lease"
-	gcLeaderLeaseFormat  = "20060102-15:04:05 -0700 MST"
+
+	gcLastRunTimeKey     = "tikv_gc_last_run_time"
+	gcRunIntervalKey     = "tikv_gc_run_interval"
+	gcDefaultRunInterval = time.Minute * 10
+	gcWaitTime           = time.Minute * 10
+
+	gcLifeTimeKey     = "tikv_gc_life_time"
+	gcDefaultLifeTime = time.Minute * 10
+	gcSafePointKey    = "tikv_gc_safe_point"
 )
 
-func (w *GCWorker) start(ver uint64) {
+var gcVariableComments = map[string]string{
+	gcLeaderUUIDKey:  "Current GC worker leader's UUID. (DO NOT EDIT)",
+	gcLeaderLeaseKey: "Current GC worker leader's lease. (DO NOT EDIT)",
+	gcLastRunTimeKey: "The time when last GC starts. (DO NOT EDIT)",
+	gcRunIntervalKey: "GC run interval, at least 10m, in Go format.",
+	gcLifeTimeKey:    "All versions within life time will not be collected by GC, at least 10m, in Go format.",
+	gcSafePointKey:   "All versions after safe point can be accessed. (DO NOT EDIT)",
+}
+
+func (w *GCWorker) start() {
 	log.Infof("[gc worker] %s start.", w.uuid)
-	safePoint := ver
-	gcIsRunning := false
 	ticker := time.NewTicker(gcWorkerTickInterval)
 	for {
 		select {
@@ -80,24 +101,19 @@ func (w *GCWorker) start(ver uint64) {
 				log.Warnf("[gc worker] check leader err: %v", err)
 				break
 			}
-			if isLeader && !gcIsRunning {
-				if w.store.oracle.IsExpired(safePoint, uint64(gcRunInterval/time.Millisecond)) {
-					gcIsRunning = true
-					go w.runGCJob(safePoint)
+			if isLeader {
+				err = w.leaderTick()
+				if err != nil {
+					log.Warnf("[gc worker] leader tikc err: %v", err)
 				}
 			}
 		case err := <-w.done:
-			gcIsRunning = false
+			w.gcIsRunning = false
+			w.lastFinish = time.Now()
 			if err != nil {
 				log.Errorf("[gc worker] runGCJob error: %v", err)
 				break
 			}
-			ver, err := w.store.CurrentVersion()
-			if err != nil {
-				log.Errorf("[gc worker] failed get current version: %v", err)
-				break
-			}
-			safePoint = ver.Ver
 		case <-w.quit:
 			log.Infof("[gc worker] (%s) quit.", w.uuid)
 			return
@@ -105,8 +121,72 @@ func (w *GCWorker) start(ver uint64) {
 	}
 }
 
-func (w *GCWorker) runGCJob(safePoint uint64) {
+// Leader of GC worker checks if it should start a GC job every tick.
+func (w *GCWorker) leaderTick() error {
+	if w.gcIsRunning {
+		return nil
+	}
+
+	// When the worker is just started, or an old GC job has just finished,
+	// wait a while before starting a new job.
+	if time.Since(w.lastFinish) < gcWaitTime {
+		return nil
+	}
+
+	// Get current time from Oracle.
+	currentVer, err := w.store.CurrentVersion()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	physical := oracle.ExtractPhysical(currentVer.Ver)
+	sec, nsec := physical/1e3, (physical%1e3)*1e3
+	now := time.Unix(sec, nsec)
+
+	// Check GC interval.
+	runInterval, err := w.loadDurationWithDefault(gcRunIntervalKey, gcDefaultRunInterval)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	lastRun, err := w.loadTime(gcLastRunTimeKey)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if lastRun != nil && lastRun.Add(*runInterval).After(now) {
+		return nil
+	}
+
+	// Calculate safe point base on lifeTime.
+	lifeTime, err := w.loadDurationWithDefault(gcLifeTimeKey, gcDefaultLifeTime)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	lastSafePoint, err := w.loadTime(gcSafePointKey)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	safePoint := now.Add(-*lifeTime)
+	// We should never decrease safePoint.
+	if lastSafePoint != nil && safePoint.Before(*lastSafePoint) {
+		return nil
+	}
+	safePointTS := oracle.ComposeTS(oracle.GetPhysical(safePoint), 0)
+
+	// Start GC job.
+	err = w.saveTime(gcLastRunTimeKey, now)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	err = w.saveTime(gcSafePointKey, safePoint)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	w.gcIsRunning = true
 	log.Infof("[gc worker] %s starts GC job, safePoint: %v", w.uuid, safePoint)
+	go w.runGCJob(safePointTS)
+	return nil
+}
+
+func (w *GCWorker) runGCJob(safePoint uint64) {
 	gcWorkerCounter.WithLabelValues("run_job").Inc()
 
 	err := w.resolveLocks(safePoint)
@@ -264,7 +344,7 @@ func (w *GCWorker) checkLeader() (bool, error) {
 	}
 	log.Debugf("[gc worker] got leader: %s", leader)
 	if leader == w.uuid {
-		err = w.updateLease()
+		err = w.saveTime(gcLeaderLeaseKey, time.Now().Add(gcWorkerLease))
 		if err != nil {
 			w.session.Execute("ROLLBACK")
 			return false, errors.Trace(err)
@@ -275,8 +355,11 @@ func (w *GCWorker) checkLeader() (bool, error) {
 		}
 		return true, nil
 	}
-	lease, err := w.loadLease()
-	if err != nil || lease.Before(time.Now()) {
+	lease, err := w.loadTime(gcLeaderLeaseKey)
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+	if lease == nil || lease.Before(time.Now()) {
 		log.Debugf("[gc worker] register %s as leader", w.uuid)
 		gcWorkerCounter.WithLabelValues("register_leader").Inc()
 
@@ -285,7 +368,7 @@ func (w *GCWorker) checkLeader() (bool, error) {
 			w.session.Execute("ROLLBACK")
 			return false, errors.Trace(err)
 		}
-		err = w.updateLease()
+		err = w.saveTime(gcLeaderLeaseKey, time.Now().Add(gcWorkerLease))
 		if err != nil {
 			w.session.Execute("ROLLBACK")
 			return false, errors.Trace(err)
@@ -300,25 +383,59 @@ func (w *GCWorker) checkLeader() (bool, error) {
 	return false, nil
 }
 
-func (w *GCWorker) updateLease() error {
-	lease := time.Now().Add(gcWorkerLease).Format(gcLeaderLeaseFormat)
-	log.Debugf("[gc worker] update leader lease to %s for worker %s", lease, w.uuid)
-	err := w.saveValueToSysTable(gcLeaderLeaseKey, lease)
+func (w *GCWorker) saveTime(key string, t time.Time) error {
+	err := w.saveValueToSysTable(key, t.Format(gcTimeFormat))
 	return errors.Trace(err)
 }
 
-func (w *GCWorker) loadLease() (time.Time, error) {
-	var t time.Time
-	str, err := w.loadValueFromSysTable(gcLeaderLeaseKey)
+func (w *GCWorker) loadTime(key string) (*time.Time, error) {
+	str, err := w.loadValueFromSysTable(key)
 	if err != nil {
-		return t, errors.Trace(err)
+		return nil, errors.Trace(err)
 	}
-	lease, err := time.Parse(gcLeaderLeaseFormat, str)
+	if str == "" {
+		return nil, nil
+	}
+	t, err := time.Parse(gcTimeFormat, str)
 	if err != nil {
-		return t, errors.Trace(err)
+		return nil, errors.Trace(err)
 	}
-	log.Debugf("[gc worker] load lease: %s", lease)
-	return lease, nil
+	return &t, nil
+}
+
+func (w *GCWorker) saveDuration(key string, d time.Duration) error {
+	err := w.saveValueToSysTable(key, d.String())
+	return errors.Trace(err)
+}
+
+func (w *GCWorker) loadDuration(key string) (*time.Duration, error) {
+	str, err := w.loadValueFromSysTable(key)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if str == "" {
+		return nil, nil
+	}
+	d, err := time.ParseDuration(str)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return &d, nil
+}
+
+func (w *GCWorker) loadDurationWithDefault(key string, def time.Duration) (*time.Duration, error) {
+	d, err := w.loadDuration(key)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if d == nil {
+		err = w.saveDuration(key, def)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		return &def, nil
+	}
+	return d, nil
 }
 
 func (w *GCWorker) loadValueFromSysTable(key string) (string, error) {
@@ -332,13 +449,21 @@ func (w *GCWorker) loadValueFromSysTable(key string) (string, error) {
 		return "", errors.Trace(err)
 	}
 	if row == nil {
+		log.Debugf("[gc worker] load kv, %s:nil", key)
 		return "", nil
 	}
-	return row.Data[0].GetString(), nil
+	value := row.Data[0].GetString()
+	log.Debugf("[gc worker] load kv, %s:%s", key, value)
+	return value, nil
 }
 
 func (w *GCWorker) saveValueToSysTable(key, value string) error {
-	stmt := fmt.Sprintf(`INSERT INTO mysql.tidb (variable_name, variable_value) VALUES ('%s', '%s') ON DUPLICATE KEY UPDATE variable_value = '%s'`, key, value, value)
+	stmt := fmt.Sprintf(`INSERT INTO mysql.tidb VALUES ('%[1]s', '%[2]s', '%[3]s')
+			       ON DUPLICATE KEY
+			       UPDATE variable_value = '%[2]s', comment = '%[3]s'`,
+		key, value, gcVariableComments[key])
+
 	_, err := w.session.Execute(stmt)
+	log.Debugf("[gc worker] save kv, %s:%s %v", key, value, err)
 	return errors.Trace(err)
 }
